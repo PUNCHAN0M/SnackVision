@@ -1,6 +1,18 @@
-"""
-ิVersion: 3.0
--Detection multiple puerson
+"""Entry point for running YOLO + BYTETrack video tracking with counting.
+
+This module refactors the original script-style implementation into a
+clean, reusable, testable class (`VideoTracker`). A command line interface
+is provided under the classic ``if __name__ == "__main__"`` guard.
+
+Example (defaults from `config.py`):
+    python run.py --max-frames 200
+
+Override model & paths:
+    python run.py --model models/yolov11n.pt --source videos/person.avi \
+        --target videos_result/out.avi --class-ids 0 2 5
+
+All heavy objects (model, trackers) are instantiated lazily when `run()`
+is called so that unit tests can import this file without side effects.
 """
 
 from __future__ import annotations
@@ -23,14 +35,18 @@ from supervision.video.source import get_video_frames_generator
 
 from yolox.tracker.byte_tracker import BYTETracker, STrack
 
-
-# -------------------- SETUP LOGGING --------------------
 LOG = logging.getLogger(__name__)
 
 
-# -------------------- SETUP BYTETRACKER PARAMETER TYPE --------------------
+# ค่า config BYTES_TRACK
 @dataclass(frozen=True)
 class BYTETrackerArgs:
+    """
+    Thin container passed into underlying BYTETracker.
+    Defaults removed to avoid duplication; values always sourced from
+    a single place (TrackerConfig / CLI). This keeps configuration DRY.
+    """
+
     track_thresh: float
     track_buffer: int
     match_thresh: float
@@ -39,9 +55,14 @@ class BYTETrackerArgs:
     mot20: bool
 
 
-# -------------------- SETUP BYTETRACKER PARAMETER AND VIDEO  PATH--------------------
+# -------------------- Main classes --------------------
 @dataclass
 class TrackerConfig:
+    """
+    High-level configuration for video tracking job.
+    Acts as the single source of truth for all tracking & counting parameters.
+    """
+
     model_body: Path
     model_object: Path
     source_video: Path
@@ -80,8 +101,7 @@ class VideoTracker:
         last_xyxy: list[float]
         center_history: list[tuple[float, float]] = field(default_factory=list)
         hold_inhand: list[str] = field(default_factory=list)
-        # list of entries: {'name': str, 'index': int (1-based within that name), 'count': int}
-        object_classes: list[dict] = field(default_factory=list)
+        object_classes: set[str] = field(default_factory=set)
 
     def __init__(self, cfg: TrackerConfig):
         self.cfg = cfg
@@ -90,6 +110,7 @@ class VideoTracker:
         self._byte_tracker: Optional[BYTETracker] = None
         self._class_names: Optional[dict] = None
         self._box_annotator: Optional[BoxAnnotator] = None
+        # Per-track info storage
         self._track_infos: dict[int, VideoTracker.TrackInfo] = {}
         self._finished_track_infos: dict[int, VideoTracker.TrackInfo] = {}
 
@@ -133,7 +154,7 @@ class VideoTracker:
     def box_annotator(self) -> BoxAnnotator:
         if self._box_annotator is None:
             self._box_annotator = BoxAnnotator(
-                color=ColorPalette(), thickness=2, text_thickness=1, text_scale=1
+                color=ColorPalette(), thickness=1, text_thickness=1, text_scale=1
             )
         return self._box_annotator
 
@@ -163,6 +184,7 @@ class VideoTracker:
 
     # -------------------- Track info management --------------------
     def update_track_infos(self, detections: Detections) -> None:
+        """Update/create TrackInfo for current detections and finalize disappeared ones."""
         current_ids: set[int] = set()
         for xyxy, conf, cid, tid in detections:
             if tid is None:
@@ -178,6 +200,8 @@ class VideoTracker:
             info = self._track_infos[tid]
             info.last_xyxy = [x1, y1, x2, y2]
             info.center_history.append((cx, cy))
+
+        # Move tracks that disappeared this frame to finished
         disappeared = [tid for tid in self._track_infos if tid not in current_ids]
         for tid in disappeared:
             self._finished_track_infos[tid] = self._track_infos.pop(tid)
@@ -190,22 +214,30 @@ class VideoTracker:
 
     # -------------------- Visualization helpers --------------------
     def draw_centers(self, frame: np.ndarray, tail: int = 15) -> None:
+        """Draw current centers and short trajectory for each active track.
+
+        tail: number of recent center points to draw per track.
+        """
+        # Detect if frame is grayscale (single channel)
         is_gray = len(frame.shape) == 2 or (
             len(frame.shape) == 3 and frame.shape[2] == 1
         )
         for tid, info in self._track_infos.items():
             if not info.center_history:
                 continue
+            # Choose color deterministic by tid (ensure ints)
             b = int((37 * tid) % 255)
             g = int((17 * tid) % 255)
             r = int((97 * tid) % 255)
             color = (b, g, r) if not is_gray else int(0.299 * r + 0.587 * g + 0.114 * b)
+            # Draw trajectory
             pts = info.center_history[-tail:]
             for i in range(1, len(pts)):
                 x1, y1 = map(int, pts[i - 1])
                 x2, y2 = map(int, pts[i])
                 thickness = 2
                 cv2.line(frame, (x1, y1), (x2, y2), color, thickness)
+            # Draw current center point
             cx, cy = map(int, pts[-1])
             cv2.circle(frame, (cx, cy), 4, color, -1)
             cv2.putText(
@@ -222,6 +254,10 @@ class VideoTracker:
     def filter_min_height(
         self, detections: Detections, frame: np.ndarray, ratio: float = 0.5
     ) -> None:
+        """In-place filter removing detections whose bbox height < ratio * frame_height.
+
+        If all detections removed, function just leaves detections empty.
+        """
         if len(detections) == 0:
             return
         frame_h = frame.shape[0]
@@ -234,6 +270,17 @@ class VideoTracker:
     def classify_objects_in_tracks(
         self, frame: np.ndarray, detections: Detections
     ) -> None:
+        """Run secondary object model on each tracked detection crop and store class names.
+
+        Strategy:
+            - For each detection with tracker_id, crop the region (with slight padding)
+            - Run the secondary model (batch for efficiency when possible)
+            - Collect predicted class names over time in TrackInfo.object_classes
+
+        Notes:
+            - If the object model predicts multiple boxes, we add all its class names.
+            - We ignore extremely small crops (w or h < 5 px) to avoid wasting inference.
+        """
         if len(detections) == 0:
             return
         # Prepare crops and track ids
@@ -281,30 +328,11 @@ class VideoTracker:
             if tid not in self._track_infos:
                 continue
             info = self._track_infos[tid]
-            # Count occurrences per class this frame
-            frame_counts: dict[str, int] = {}
             for cid in cls_ids:
-                cname = str(names[cid]) if names and cid in names else str(cid)
-                frame_counts[cname] = frame_counts.get(cname, 0) + 1
-            # For each class, update / create entries
-            for cname, detected_count in frame_counts.items():
-                existing = [e for e in info.object_classes if e["name"] == cname]
-                if detected_count > len(existing):
-                    # create new entries for additional instances
-                    for new_idx in range(len(existing) + 1, detected_count + 1):
-                        info.object_classes.append(
-                            {"name": cname, "index": new_idx, "count": 1}
-                        )
-                    # Increment counts of existing ones (first len(existing))
-                    for e in existing:
-                        e["count"] += 1
+                if names and cid in names:
+                    info.object_classes.add(str(names[cid]))
                 else:
-                    # increment first detected_count entries only
-                    for e in sorted(existing, key=lambda x: x["index"])[
-                        :detected_count
-                    ]:
-                        e["count"] += 1
-            # Classes with zero in this frame: do nothing (persist)
+                    info.object_classes.add(str(cid))
 
     # -------------------- Core logic --------------------
     def run(self) -> None:
@@ -361,33 +389,24 @@ class VideoTracker:
                     )
                     detections.filter(mask=mask, inplace=True)
 
-                # Update track info (centers & history)
-                self.update_track_infos(detections)
-
-                # Secondary object detection per track (crop-based)
-                self.classify_objects_in_tracks(frame, detections)
-
-                # Build labels after updating object instance counters
-                labels: list[str] = []
+                labels = []
                 for xyxy, conf, cid, tid in detections:
                     if tid is None:
                         labels.append(f"#? {conf:0.2f}")
                         continue
                     info = self._track_infos.get(tid)
                     if info and info.object_classes:
-                        # Format: snack(1:3),snack(2:1),food(1:2)
-                        # Keep stable order: by name then index
-                        ordered = sorted(
-                            info.object_classes, key=lambda e: (e["name"], e["index"])
-                        )
-                        parts = [
-                            f"{e['name']}({e['index']}:{e['count']})"
-                            for e in ordered[:4]
-                        ]
-                        label = f"#{tid} {conf:0.2f} [{','.join(parts)}]"
+                        objs = ",".join(sorted(list(info.object_classes))[:3])
+                        label = f"#{tid} {conf:0.2f} [{objs}]"
                     else:
                         label = f"#{tid} {conf:0.2f}"
                     labels.append(label)
+
+                # Update track info (centers & history)
+                self.update_track_infos(detections)
+
+                # Secondary object detection per track (crop-based)
+                self.classify_objects_in_tracks(frame, detections)
 
                 # Annotation
                 frame = self.box_annotator.annotate(
@@ -404,7 +423,6 @@ class VideoTracker:
         )
 
 
-# -------------------- Parse CLI Parameter and Path --------------------
 def parse_cli(argv: Optional[Sequence[str]] = None) -> TrackerConfig:
     """Parse raw CLI args and build a TrackerConfig instance."""
     args = raw_parse_args(argv)
@@ -414,8 +432,8 @@ def parse_cli(argv: Optional[Sequence[str]] = None) -> TrackerConfig:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
     return TrackerConfig(
-        model_body=args.model_person,
-        model_object=args.model_object,
+    model_body=args.model_body,
+    model_object=args.model_object,
         source_video=args.source,
         target_video=args.target,
         class_ids=args.class_ids,

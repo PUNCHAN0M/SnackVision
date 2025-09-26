@@ -17,11 +17,14 @@ import config
 
 @dataclass
 class Defaults:
-    model: Path = Path(config.MODEL_BODY_PATH)
+    model_person: Path = Path(config.MODEL_PERSON_PATH)
+    model_object: Path = Path(config.MODEL_OBJECT_PATH)
+    model_person_confidence_threshold: float = config.MODEL_PERSON_CONFIDENCE_THRESHOLD
+    model_object_confidence_threshold: float = config.MODEL_OBJECT_CONFIDENCE_THRESHOLD
     source: Path = Path(config.SOURCE_VIDEO_PATH)
     target: Path = Path(config.TARGET_VIDEO_PATH)
     target_metadata: Path = Path(config.TARGET_METADATA_PATH)
-    class_ids: Sequence[int] = tuple(config.MODEL_BODY_CLASS_TARGET)
+    class_ids: Sequence[int] = tuple(config.MODEL_PERSON_CLASS_TARGET)
     line_start = (50, 1500)
     line_end = (3840 - 50, 1500)
     max_frames: int = config.MAX_FRAMES
@@ -32,6 +35,7 @@ class Defaults:
     min_box_area: float = config.MIN_BOX_AREA
     mot20: bool = config.MOT20
     log_level: str = "INFO"
+    progress: bool = config.PROGRESS
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -41,11 +45,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # Core paths & model
     group_core = parser.add_argument_group("Core IO & Model")
     group_core.add_argument(
-        "--model", type=Path, default=d.model, help="YOLO model .pt file"
+        "--model_person",
+        type=Path,
+        default=d.model_person,
+        help="YOLO model_person .pt file",
     )
+    group_core.add_argument(
+        "--model_object",
+        type=Path,
+        default=d.model_object,
+        help="YOLO model_object .pt file",
+    )
+    group_core.add_argument(
+        "--model-person-confidence-threshold",
+        type=float,
+        default=d.model_person_confidence_threshold,
+        help="Confidence threshold for person model",
+    )
+    group_core.add_argument(
+        "--model-object-confidence-threshold",
+        type=float,
+        default=d.model_object_confidence_threshold,
+        help="Confidence threshold for object model",
+    )
+
     group_core.add_argument(
         "--source", type=Path, default=d.source, help="Input video path"
     )
