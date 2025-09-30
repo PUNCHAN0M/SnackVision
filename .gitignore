@@ -85,3 +85,7 @@ ByteTrack/video_dataset/
 ByteTrack/csvdata/
 ByteTrack/results/
 ByteTrack/videos/
+ByteTrack/results_test_after/
+ByteTrack/results_test/
+ByteTrack/video_dataset_test/
+
